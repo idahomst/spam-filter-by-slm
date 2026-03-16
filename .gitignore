@@ -1,0 +1,25 @@
+# Credentials — never commit
+.env
+
+# ChromaDB vector store
+spam_memory/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
