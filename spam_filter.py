@@ -15,9 +15,11 @@ Usage:
 
 import argparse
 import email
+import fcntl
 import logging
 import os
 import sys
+import tempfile
 from email.policy import default
 from logging.handlers import SysLogHandler
 
@@ -288,6 +290,16 @@ def validate_config() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Prevent concurrent cron runs: acquire an exclusive lock before doing any work.
+    # If another instance is already running, exit immediately and silently.
+    lock_path = os.path.join(tempfile.gettempdir(), "spam_filter.lock")
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.info("Another instance is already running — exiting.")
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
         description="AI Mail Sentry — SLM-based spam filter"
     )

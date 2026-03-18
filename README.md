@@ -152,10 +152,14 @@ Output is written both to the console and to syslog (`journalctl -t mail-filter`
 
 ```
 # Classify new mail every 15 minutes (incremental DB sync)
-*/15 * * * * /path/to/spam-filter-by-slm/venv/bin/python /path/to/spam-filter-by-slm/spam_filter.py > /dev/null 2>&1
+# `timeout 720` kills the process after 12 minutes — before the next tick fires.
+# This prevents process pile-up if Ollama or IMAP stalls.
+# The built-in lock (spam_filter.lock) also ensures only one instance runs at a time.
+*/15 * * * * timeout 720 /path/to/spam-filter-by-slm/venv/bin/python /path/to/spam-filter-by-slm/spam_filter.py > /dev/null 2>&1
 
 # Full DB rebuild every Sunday at 02:00 (picks up bulk-deleted junk, refreshes HAM)
-0 2 * * 0  /path/to/spam-filter-by-slm/venv/bin/python /path/to/spam-filter-by-slm/spam_filter.py --rebuild-db > /dev/null 2>&1
+# Allow up to 3 hours for a full rebuild.
+0 2 * * 0  timeout 10800 /path/to/spam-filter-by-slm/venv/bin/python /path/to/spam-filter-by-slm/spam_filter.py --rebuild-db > /dev/null 2>&1
 ```
 
 ## Model selection
