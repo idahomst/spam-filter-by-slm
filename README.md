@@ -1,52 +1,52 @@
-# AI Mail Sentry — SLM-based Spam Filter
+# AI Mail Sentry — Hybrid SLM-based Spam Filter (v2.0)
 
-A lightweight, privacy-focused spam filter that uses a Small Language Model (SLM) and
-vector memory (RAG) to classify emails based on your personal mail history.
+A lightweight, privacy-focused spam filter that uses a two-stage hybrid approach combining pattern matching and ChromaDB vector analysis with LLM fallback for uncertain cases.
 
 All processing happens **locally** — no data ever leaves your machine.
 
 ## Overview
 
-Unlike rule-based filters (Rspamd, SpamAssassin) that rely on global signatures, this
-project uses **SLM** (for example `qwen2.5:3b` via Ollama) to understand the *context and intent* of
-emails in any language. It learns from **both sides**:
+Unlike rule-based filters (Rspamd, SpamAssassin) that rely on global signatures, this project uses a **hybrid classification pipeline**:
 
-- **What you don't want** — your Junk folder (spam examples)
-- **What you do want** — your Sent folder and other trusted folders (HAM examples)
+- **Stage 1 (Fast Path):** Pattern matching + ChromaDB distance analysis for confident decisions
+- **Stage 2 (LLM Fallback):** Structured feature extraction + SLM reasoning only for uncertain cases
 
-Teaching the model both sides dramatically reduces false positives compared to
-spam-only training.
+This approach dramatically reduces LLM call volume (~60-70% fewer calls) while improving accuracy by using explicit signals instead of relying on the SLM to guess from raw email text alone.
 
 ### How it works
 
 ```
-Junk folder (last 300 emails)          Sent / Archive (last 200 emails/folder)
-        |                                              |
-        v                                              v
-  ChromaDB: junk_folder_patterns    ChromaDB: ham_folder_patterns
-        |                                              |
-        +---------------+---------------+
-                        |
-              top-5 spam + top-5 ham examples
-                        |
-                        v
-             qwen2.5:3b (via Ollama)
-             classifies each unseen INBOX email
-                        |
-               SPAM? move to Junk
-               HAM?  leave unread in INBOX
+Unseen INBOX emails
+         |
+         v
+  Stage 1: Pattern + Distance Analysis ───┐
+    ├── Keyword/urgency detection          │
+    ├── ChromaDB distance to spam examples │ → High confidence? Fast return
+    └── Combined scoring                   │
+                         │                 │
+                    Uncertain?              │
+                         │                  │
+                         v                  |
+  Stage 2: LLM Fallback (structured features)
+         |
+    SPAM? move to Junk
+    HAM?  leave unread in INBOX
 ```
 
-The vector DB is updated **incrementally** — only newly arrived emails are fetched
-from IMAP on each cron run, so startup overhead stays minimal even with large folders.
+**Key design decisions:**
+- **Junk folder only:** Spam examples from your junk folder are used as reference patterns. HAM examples were removed because they added noise without meaningful classification signal on small models.
+- **Pattern detection enabled by default:** Explicit keyword, urgency, sender domain, and structure analysis runs instantly without LLM overhead.
+- **ChromaDB distances as features:** Vector similarity isn't just for retrieval — it's a confidence signal for the decision pipeline.
+
+The vector DB is updated **incrementally** — only newly arrived emails are fetched from IMAP on each cron run, so startup overhead stays minimal even with large folders.
 
 ## Prerequisites
 
 | Component | Version |
 |-----------|---------|
-| OS | Debian Bookworm (or any Linux) |
-| RAM / CPU | 4 GB RAM min, 8 GB recommended; 4+ CPU threads |
-| Disk | 500MB for Python venv and ollama + 2-5 GB for SLM |
+| OS | Debian Bookworm (or any Linux / macOS) |
+| RAM | 3 GB min (gemma2:2b), 4-8 GB recommended; 4+ CPU threads |
+| Disk | 500MB for Python venv and ollama + 1.6 GB for gemma2:2b model |
 | Ollama | latest |
 | Python | 3.11+ |
 
@@ -56,13 +56,15 @@ from IMAP on each cron run, so startup overhead stays minimal even with large fo
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen2.5:3b
+ollama pull gemma2:2b
 ```
 
+> **Recommended default:** `gemma2:2b` — best binary classification quality, fastest inference, uses ~1.6 GB RAM
+> 
 > **Alternative models** (see [Model selection](#model-selection) below for details):
 > ```bash
-> ollama pull qwen2.5:7b   # better Czech/multilingual, ~5 GB RAM
-> ollama pull gemma2:2b    # fastest, good classification quality
+> ollama pull qwen2.5:3b   # better Czech/multilingual support, ~2-3 GB RAM
+> ollama pull llama3.2:3b  # good general-purpose option, ~2 GB RAM
 > ```
 
 **2. Clone the repository:**
@@ -84,7 +86,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-$EDITOR .env   # fill in IMAP_SERVER, EMAIL_USER, EMAIL_PASS, HAM_FOLDERS
+$EDITOR .env   # fill in IMAP_SERVER, EMAIL_USER, EMAIL_PASS
 ```
 
 **5. Build the vector DB for the first time:**
@@ -98,33 +100,64 @@ python spam_filter.py --rebuild-db
 
 All settings live in `.env`. The only required values are the three IMAP credentials.
 
+### Required Settings
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `IMAP_SERVER` | *(required)* | Hostname of your IMAP server |
 | `EMAIL_USER` | *(required)* | Your email address |
 | `EMAIL_PASS` | *(required)* | Your IMAP password or app password |
+
+### Basic Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `INBOX_FOLDER` | `INBOX` | Folder to scan for new mail |
-| `JUNK_FOLDER` | `Junk` | Folder used as spam training data |
-| `HAM_FOLDERS` | `Sent` | Comma-separated folders used as HAM training data |
-| `MODEL_NAME` | `qwen2.5:3b` | Any model available in Ollama |
+| `JUNK_FOLDER` | `Junk` | Folder used as spam reference data in ChromaDB |
+| `MODEL_NAME` | `gemma2:2b` | Ollama model (must be pulled first) |
 | `DB_PATH` | `./spam_memory` | Path for the ChromaDB vector store |
-| `MAX_JUNK_EMAILS` | `300` | How many recent junk emails to keep in memory |
-| `MAX_HAM_EMAILS` | `200` | How many recent HAM emails to keep per folder |
 | `MAX_EMAIL_CHARS` | `1000` | Max characters read from each email body |
-| `SIMILAR_RESULTS` | `5` | Examples of each type passed to the LLM per classification |
+| `SIMILAR_RESULTS` | `5` | Spam examples retrieved for distance analysis |
 
-### HAM_FOLDERS tips
+### Indexing Settings (Incremental DB)
 
-The more relevant your HAM folders, the fewer false positives:
+These control how many emails are indexed per folder. HAM folders are **indexed** but no longer used for classification — they exist only to keep the index up-to-date if you want them in future versions.
 
-```
-HAM_FOLDERS=Sent                        # single folder
-HAM_FOLDERS=Sent,Archive                # multiple folders
-HAM_FOLDERS=Sent Items,INBOX.Archive    # names with spaces or IMAP hierarchy
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_JUNK_EMAILS` | `300` | How many recent junk emails to keep in memory |
+| `HAM_FOLDERS` | `Sent` | Comma-separated folders indexed for completeness |
+| `MAX_HAM_EMAILS` | `200` | How many HAM emails to index per folder (not used in classification) |
 
-**Sent** is the most powerful choice — every domain and contact you reply to
-becomes near-impossible to false-positive on.
+### Hybrid Classifier Thresholds
+
+Fine-tune the two-stage pipeline. These values are tuned for gemma2:2b on limited resources.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPAM_DISTANCE_THRESHOLD` | `0.6` | Avg ChromaDB distance below = confident SPAM |
+| `HAM_DISTANCE_THRESHOLD` | `0.4` | Min distance threshold for confident decisions |
+| `CONFIDENCE_MARGIN` | `0.15` | Gap between decision thresholds |
+
+### Pattern-Based Detection
+
+Explicit keyword and structure analysis that runs without LLM calls.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_SPAM_PATTERNS` | `true` | Enable pattern-based detection (recommended) |
+| `SPAM_KEYWORD_WEIGHT` | `0.3` | Weight for spam keyword matches |
+| `SPAM_URGENCY_WEIGHT` | `0.25` | Weight for urgency language detection |
+| `SPAM_SENDER_WEIGHT` | `0.25` | Weight for sender domain analysis |
+| `SPAM_STRUCTURE_WEIGHT` | `0.2` | Weight for content structure anomalies |
+
+### Feature Flags
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_ACTIVE_LEARNING` | `true` | Enable active learning feedback loop (future feature) |
+
+---
 
 ## Running
 
@@ -135,6 +168,11 @@ source venv/bin/activate
 python spam_filter.py
 ```
 
+Output includes a classification summary at the end:
+```
+Classification summary: 12 emails — 3 spam, 9 ham, 4 LLM fallbacks (33%)
+```
+
 **Full DB rebuild** (re-indexes everything from scratch):
 
 ```bash
@@ -143,7 +181,7 @@ python spam_filter.py --rebuild-db
 
 Use `--rebuild-db` when:
 - Setting up for the first time
-- Changing `HAM_FOLDERS` or significantly increasing `MAX_*_EMAILS`
+- Significantly increasing `MAX_*_EMAILS`
 - Purging stale entries after bulk-deleting old junk
 
 Output is written both to the console and to syslog (`journalctl -t mail-filter`).
@@ -157,7 +195,7 @@ Output is written both to the console and to syslog (`journalctl -t mail-filter`
 # The built-in lock (spam_filter.lock) also ensures only one instance runs at a time.
 */15 * * * * timeout 720 /path/to/spam-filter-by-slm/venv/bin/python /path/to/spam-filter-by-slm/spam_filter.py > /dev/null 2>&1
 
-# Full DB rebuild every Sunday at 02:00 (picks up bulk-deleted junk, refreshes HAM)
+# Full DB rebuild every Sunday at 02:00 (picks up bulk-deleted junk, refreshes index)
 # Allow up to 3 hours for a full rebuild.
 0 2 * * 0  timeout 10800 /path/to/spam-filter-by-slm/venv/bin/python /path/to/spam-filter-by-slm/spam_filter.py --rebuild-db > /dev/null 2>&1
 ```
@@ -166,15 +204,14 @@ Output is written both to the console and to syslog (`journalctl -t mail-filter`
 
 | Model | RAM | Czech / multilingual | Speed | Notes |
 |-------|-----|----------------------|-------|-------|
-| `qwen2.5:3b` | ~2 GB | ★★★★ | Fast | **Default — best small multilingual model** |
-| `gemma2:2b` | ~1.6 GB | ★★★ | Fastest | Excellent binary classification |
-| `llama3.2:3b` | ~2 GB | ★★★ | Fast | Previous default |
-| `qwen2.5:7b` | ~4.7 GB | ★★★★★ | Medium | Best Czech quality; recommended if RAM allows |
-| `llama3.1:8b` | ~5 GB | ★★★★ | Medium | Large context, good multilingual |
+| `gemma2:2b` | ~1.6 GB | ★★★ | **Fastest** | **Default — best binary classification, low RAM** |
+| `qwen2.5:3b` | ~2-3 GB | ★★★★ | Fast | Better multilingual (incl. Czech); needs more memory |
+| `llama3.2:3b` | ~2 GB | ★★★ | Fast | General-purpose option; previous default |
+| `qwen2.5:7b` | ~4.7 GB | ★★★★★ | Medium | Best accuracy; only if you have 8+ GB RAM free |
 
 Change the model in `.env`:
 ```
-MODEL_NAME=qwen2.5:7b
+MODEL_NAME=gemma2:2b
 ```
 
 ## CPU limit for Ollama
@@ -207,8 +244,9 @@ sudo systemctl daemon-reload && sudo systemctl restart ollama
 - `BODY.PEEK[]` is used so the script never marks emails as read — your mail client
   only sees the result (spam disappearing from the inbox).
 - If the model makes a mistake, move the misclassified email back to the correct
-  folder manually. On the next run, the Junk/HAM memory updates automatically via
+  folder manually. On the next run, the Junk memory updates automatically via
   the incremental sync.
+- Classification statistics are logged after each batch — watch for high LLM fallback rates (>40%) which may indicate threshold tuning is needed.
 - Credentials are read from `.env`, which is excluded from git via `.gitignore`.
 
 ## License

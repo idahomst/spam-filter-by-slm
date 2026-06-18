@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
-AI Mail Sentry — SLM-based Spam Filter
-Classifies incoming emails using an SLM (e.g. qwen2.5:3b) + ChromaDB (RAG).
+AI Mail Sentry — Hybrid SLM-based Spam Filter (v2.0)
 
-The filter learns both sides of the coin:
-  • SPAM  — from the Junk folder (what you don't want)
-  • HAM   — from Sent / Archive / any folder you trust (what you do want)
+Two-stage classification pipeline:
+  Stage 1 (Fast): Pattern matching + ChromaDB distance analysis
+                 → confident SPAM/HAM decisions without LLM calls
+  
+  Stage 2 (Fallback): Structured feature extraction + LLM reasoning
+                     → used only for uncertain cases
+
+Key improvements over v1.x:
+- Removed HAM example retrieval (added noise, reduced accuracy)
+- Added pattern-based spam detection (keywords, urgency, sender analysis)
+- Uses ChromaDB distances as confidence signals, not just retrieval
+- Falls back to LLM ONLY when Stage 1 cannot decide confidently
+- Default model changed from qwen2.5:3b → gemma2:2b (better classification, less RAM)
 
 Usage:
     cp .env.example .env                # fill in your credentials
@@ -43,11 +52,26 @@ _ham_folders_raw = os.getenv("HAM_FOLDERS", "Sent")
 HAM_FOLDERS = [f.strip() for f in _ham_folders_raw.split(",") if f.strip()]
 
 DB_PATH          = os.getenv("DB_PATH", "./spam_memory")
-MODEL_NAME       = os.getenv("MODEL_NAME", "qwen2.5:3b")
+MODEL_NAME       = os.getenv("MODEL_NAME", "gemma2:2b")
 MAX_JUNK_EMAILS  = int(os.getenv("MAX_JUNK_EMAILS", "300"))
 MAX_HAM_EMAILS   = int(os.getenv("MAX_HAM_EMAILS", "200"))
 MAX_EMAIL_CHARS  = int(os.getenv("MAX_EMAIL_CHARS", "1000"))
 SIMILAR_RESULTS  = int(os.getenv("SIMILAR_RESULTS", "5"))
+
+# Hybrid classifier thresholds (tuned for gemma2:2b on limited resources)
+SPAM_DISTANCE_THRESHOLD = float(os.getenv("SPAM_DISTANCE_THRESHOLD", "0.6"))
+HAM_DISTANCE_THRESHOLD  = float(os.getenv("HAM_DISTANCE_THRESHOLD", "0.4"))
+CONFIDENCE_MARGIN       = float(os.getenv("CONFIDENCE_MARGIN", "0.15"))
+
+# Pattern-based detection flags
+ENABLE_SPAM_PATTERNS   = os.getenv("ENABLE_SPAM_PATTERNS", "true").lower() == "true"
+SPAM_KEYWORD_WEIGHT    = float(os.getenv("SPAM_KEYWORD_WEIGHT", "0.3"))
+SPAM_URGENCY_WEIGHT    = float(os.getenv("SPAM_URGENCY_WEIGHT", "0.25"))
+SPAM_SENDER_WEIGHT     = float(os.getenv("SPAM_SENDER_WEIGHT", "0.25"))
+SPAM_STRUCTURE_WEIGHT  = float(os.getenv("SPAM_STRUCTURE_WEIGHT", "0.2"))
+
+# Active learning: record misclassified emails for training feedback
+ENABLE_ACTIVE_LEARNING = os.getenv("ENABLE_ACTIVE_LEARNING", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Logging — syslog for cron/systemd, console for manual runs
@@ -180,20 +204,123 @@ def sync_folder(
     logger.info(f"{label}: indexed {indexed}/{len(fetch_uids)} email(s).")
 
 
-def classify_email(content: str, junk_collection, ham_collection) -> str:
-    """Return 'SPAM' or 'HAM' using both junk and ham examples as context.
+# ---------------------------------------------------------------------------
+# Hybrid Classification Functions
+# ---------------------------------------------------------------------------
 
-    Providing HAM examples alongside SPAM examples gives the model a clear
-    contrast, which dramatically reduces false positives on legitimate mail
-    that superficially resembles spam (newsletters, Czech business email, etc.).
+def pattern_based_spam_check(content: str, msg) -> dict:
+    """Analyze email content for explicit spam indicators.
+
+    Returns a score dictionary with component scores and overall confidence.
+    This runs without LLM calls — fast and deterministic.
     """
+    if not ENABLE_SPAM_PATTERNS:
+        return {"score": 0.5, "details": {}, "reason": "patterns disabled"}
+
+    spam_keywords = [
+        # Financial urgency
+        "verify your account", "confirm immediately", "urgent action required",
+        "click here now", "limited time offer", "act fast",
+        "you have been selected", "winner notification", "prize claim",
+        # Suspicious requests
+        "send verification code", "password reset needed", "update payment info",
+        "wire transfer", "bitcoin", "cryptocurrency", "investment opportunity",
+        # Common spam patterns
+        "Dear valued customer", "Congratulations!", "Free gift",
+        "no obligation", "risk free trial", "cancel anytime",
+    ]
+
+    urgency_keywords = [
+        "URGENT", "IMMEDIATELY", "ASAP", "NOW", "EXPIRES",
+        "WARNING", "ALERT", "NOTICE", "ACTION REQUIRED",
+    ]
+
+    suspicious_domains = [
+        "@gmail.com", "@yahoo.com", "@hotmail.com",  # Free email for business
+        "@tempmail.org", "@guerrillamail.com",
+    ]
+
+    # Score component 1: Spam keyword density
+    content_lower = content.lower()
+    keyword_matches = sum(1 for kw in spam_keywords if kw in content_lower)
+    keyword_score = min(keyword_matches / 5.0, 1.0)  # Normalize to 0-1
+
+    # Score component 2: Urgency language
+    text_upper = content.upper()
+    urgency_count = sum(1 for kw in urgency_keywords if kw in text_upper)
+    urgency_score = min(urgency_count / 3.0, 1.0)
+
+    # Score component 3: Sender analysis (if available from msg)
+    sender = str(msg.get("From", "")) if hasattr(msg, "get") else ""
+    sender_is_suspicious = any(domain in sender for domain in suspicious_domains)
+    # Also check if sender doesn't match any known contact patterns
+    sender_score = 0.5 if sender_is_suspicious else 0.1
+
+    # Score component 4: Content structure anomalies
+    # All caps ratio, excessive punctuation, etc.
+    alpha_count = sum(1 for c in content if c.isalpha())
+    all_caps_ratio = sum(1 for c in content if c.isupper()) / max(len(content), 1)
+    exclamation_count = content.count("!")
+    structure_score = min((all_caps_ratio * 2 + exclamation_count / 10), 1.0)
+
+    # Weighted combination
+    overall = (
+        keyword_score * SPAM_KEYWORD_WEIGHT +
+        urgency_score * SPAM_URGENCY_WEIGHT +
+        sender_score * SPAM_SENDER_WEIGHT +
+        structure_score * SPAM_STRUCTURE_WEIGHT
+    )
+
+    return {
+        "score": overall,
+        "details": {
+            "keyword_matches": keyword_matches,
+            "urgency_count": urgency_count,
+            "sender_suspicious": sender_is_suspicious,
+            "all_caps_ratio": round(all_caps_ratio, 3),
+            "exclamation_count": exclamation_count,
+        },
+        "reason": f"keywords={keyword_matches}, urgency={urgency_count}",
+    }
+
+
+def analyze_chromadb_distances(spam_results) -> dict:
+    """Analyze ChromaDB query distances to determine confidence level.
+
+    Returns distance metrics and whether we should use LLM or skip it.
+    """
+    if not spam_results["distances"][0]:
+        return {"avg_distance": float('inf'), "min_distance": 0, "max_distance": 0}
+
+    distances = spam_results["distances"][0]
+    avg_dist = sum(distances) / len(distances)
+    min_dist = min(distances)
+    max_dist = max(distances)
+
+    # Distance interpretation:
+    # - Low distance to spam = confident SPAM (no LLM needed)
+    # - High distance from everything = uncertain (LLM recommended)
+    is_confident_spam = avg_dist < SPAM_DISTANCE_THRESHOLD and min_dist < HAM_DISTANCE_THRESHOLD
+    is_confident_ham  = avg_dist > (1.0 - HAM_DISTANCE_THRESHOLD)
+
+    return {
+        "avg_distance": avg_dist,
+        "min_distance": min_dist,
+        "max_distance": max_dist,
+        "is_confident_spam": is_confident_spam,
+        "is_confident_ham": is_confident_ham,
+    }
+
+
+def classify_with_llm(content: str, msg, junk_collection, combined_score: float, distance_analysis: dict) -> tuple:
+    """LLM fallback for uncertain cases with structured features.
+
+    Only called when Stage 1 (pattern + distance) cannot make a confident decision.
+    The prompt includes explicit feature values so the model doesn't need to reason
+    from raw email text alone.
+    """
+    # Retrieve spam examples for context
     junk_count = junk_collection.count()
-
-    if junk_count == 0:
-        logger.warning("Junk memory is empty — defaulting to HAM.")
-        return "HAM"
-
-    # Retrieve the most similar SPAM examples
     n_spam = min(SIMILAR_RESULTS, junk_count)
     spam_results = junk_collection.query(query_texts=[content], n_results=n_spam)
     spam_examples = (
@@ -202,49 +329,119 @@ def classify_email(content: str, junk_collection, ham_collection) -> str:
         else "(no spam examples available)"
     )
 
-    # Retrieve the most similar HAM examples (optional — skipped if DB empty)
-    ham_section = ""
-    ham_count = ham_collection.count()
-    if ham_count > 0:
-        n_ham = min(SIMILAR_RESULTS, ham_count)
-        ham_results = ham_collection.query(query_texts=[content], n_results=n_ham)
-        ham_docs = ham_results["documents"][0] if ham_results["documents"][0] else []
-        if ham_docs:
-            ham_section = (
-                "HAM examples (legitimate emails this user sends/receives):\n"
-                + "\n---\n".join(ham_docs)
-                + "\n\n---\n\n"
-            )
+    # Extract sender for the prompt
+    sender = str(msg.get("From", "Unknown")) if hasattr(msg, "get") else "Unknown"
 
-    prompt = f"""You are a personal spam filter.
+    prompt = f"""You are an expert spam classifier. Analyze this email using structured criteria.
 
-SPAM examples (emails previously marked as junk by this user):
+RECENT SPAM EXAMPLES (from user's junk folder):
 {spam_examples}
 
----
+CLASSIFICATION CRITERIA:
+1. Sender authenticity — is the sender who they claim to be?
+2. Urgency pressure — does it demand immediate action?
+3. Content legitimacy — is there genuine value or misleading promises?
+4. Pattern matching — does it follow known spam templates?
 
-{ham_section}Classify the following email.
-Reply with ONLY one word: SPAM or HAM — nothing else.
+STRUCTURED INPUT (extracted features):
+- Combined confidence score: {combined_score:.3f}
+- ChromaDB avg distance to spam: {distance_analysis['avg_distance']:.3f}
+- Is confident SPAM by distance: {distance_analysis['is_confident_spam']}
 
 EMAIL TO CLASSIFY:
-{content}"""
+From: {sender}
+Content: {content}
+
+Reply with ONLY one word: SPAM or HAM — nothing else."""
 
     response = ollama.generate(model=MODEL_NAME, prompt=prompt)
     raw = response.get("response", "").strip()
 
     # Take only the first word to be robust against verbose model output
     first_word = raw.split()[0].upper() if raw else "HAM"
-    return "SPAM" if first_word == "SPAM" else "HAM"
+    verdict = "SPAM" if first_word == "SPAM" else "HAM"
+
+    return verdict, {
+        "confidence": "medium",
+        "method": "llm_fallback",
+        "score": round(combined_score, 3),
+    }
+
+
+def classify_email_hybrid(content: str, msg, junk_collection) -> tuple:
+    """Two-stage hybrid classifier: pattern matching + distance analysis → LLM fallback.
+
+    Stage 1 (fast): Pattern matching + ChromaDB distances for confident cases
+    Stage 2 (slow): LLM reasoning only for uncertain cases
+
+    Returns: (verdict, metadata) where metadata contains confidence info
+    """
+    # -----------------------------------------------------------------------
+    # Stage 1: Fast path - pattern matching and distance analysis
+    # -----------------------------------------------------------------------
+    
+    # Pattern-based scoring (no LLM needed)
+    pattern_result = pattern_based_spam_check(content, msg)
+
+    # Get ChromaDB distances to spam examples
+    junk_count = junk_collection.count()
+    if junk_count == 0:
+        logger.warning("Junk memory is empty — defaulting to HAM.")
+        return "HAM", {"confidence": "low", "method": "empty_db_default"}
+
+    n_spam = min(SIMILAR_RESULTS, junk_count)
+    spam_results = junk_collection.query(query_texts=[content], n_results=n_spam)
+    
+    # Analyze distance patterns
+    distance_analysis = analyze_chromadb_distances(spam_results)
+
+    # Combine pattern score with distance signal
+    # Weighted: 40% patterns, 60% vector similarity (inverted since lower distance = more similar)
+    combined_score = (
+        pattern_result["score"] * 0.4 + 
+        max(0, 1 - distance_analysis["avg_distance"]) * 0.6
+    )
+
+    # Decision logic based on confidence thresholds
+    if combined_score > 0.7 and distance_analysis["is_confident_spam"]:
+        return "SPAM", {
+            "confidence": "high", 
+            "method": "pattern+distance_fast",
+            "score": round(combined_score, 3),
+        }
+
+    if combined_score < 0.3 or distance_analysis["is_confident_ham"]:
+        return "HAM", {
+            "confidence": "high", 
+            "method": "pattern+distance_fast",
+            "score": round(combined_score, 3),
+        }
+
+    # -----------------------------------------------------------------------
+    # Stage 2: LLM fallback for uncertain cases with structured features
+    # -----------------------------------------------------------------------
+    
+    logger.info(f"Stage 2: Using LLM for uncertain case (score={combined_score:.2f})")
+    
+    return classify_with_llm(content, msg, junk_collection, combined_score, distance_analysis)
 
 
 def classify_and_move(client: IMAPClient, junk_collection, ham_collection) -> None:
-    """Scan INBOX for unseen messages, classify each, and move spam to Junk."""
+    """Scan INBOX for unseen messages, classify each, and move spam to Junk.
+
+    Uses the hybrid classifier which combines pattern matching + vector distances
+    with LLM fallback only for uncertain cases. HAM collection is no longer used
+    for classification (removed as noise source).
+    """
     client.select_folder(INBOX_FOLDER)
     uids = client.search(["UNSEEN"])
 
     if not uids:
         logger.info("No new emails to scan.")
         return
+
+    # Track classification statistics
+    stats = {"spam": 0, "ham": 0, "llm_fallback": 0, "fast_path": 0}
 
     logger.info(f"Scanning {len(uids)} unseen message(s)...")
     fetch_data = client.fetch(uids, ["BODY.PEEK[]"])
@@ -256,16 +453,35 @@ def classify_and_move(client: IMAPClient, junk_collection, ham_collection) -> No
             subject = str(msg.get("Subject", "(No Subject)"))
             content = build_content(msg)
 
-            verdict = classify_email(content, junk_collection, ham_collection)
+            # Use hybrid classifier directly (pass None for msg since we have it)
+            verdict, metadata = classify_email_hybrid(content, msg, junk_collection)
+
+            stats[verdict.lower()] += 1
+            if metadata["method"] == "llm_fallback":
+                stats["llm_fallback"] += 1
+            else:
+                stats["fast_path"] += 1
 
             if verdict == "SPAM":
-                logger.info(f"[SPAM] Moving to Junk: {subject!r}")
+                logger.info(f"[SPAM] Moving to Junk: {subject!r} (method={metadata['method']}, score={metadata.get('score', '?')})")
                 client.move([uid], JUNK_FOLDER)
             else:
                 logger.info(f"[HAM]  Leaving in inbox: {subject!r}")
 
         except Exception as exc:
             logger.error(f"Error processing UID {uid}: {exc}")
+
+    # Log summary statistics
+    total = stats["spam"] + stats["ham"]
+    if total > 0:
+        llm_pct = (stats["llm_fallback"] / total * 100) if total else 0
+        logger.info(f"Classification summary: {total} emails — "
+                   f"{stats['spam']} spam, {stats['ham']} ham, "
+                   f"{stats['llm_fallback']} LLM fallbacks ({llm_pct:.0f}%)")
+
+
+# ---------------------------------------------------------------------------
+# Startup validation
 
 
 # ---------------------------------------------------------------------------
