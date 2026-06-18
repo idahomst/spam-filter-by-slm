@@ -48,13 +48,9 @@ EMAIL_PASS    = os.environ.get("EMAIL_PASS", "")
 INBOX_FOLDER  = os.getenv("INBOX_FOLDER", "INBOX")
 JUNK_FOLDER   = os.getenv("JUNK_FOLDER", "Junk")
 
-_ham_folders_raw = os.getenv("HAM_FOLDERS", "Sent")
-HAM_FOLDERS = [f.strip() for f in _ham_folders_raw.split(",") if f.strip()]
-
 DB_PATH          = os.getenv("DB_PATH", "./spam_memory")
 MODEL_NAME       = os.getenv("MODEL_NAME", "gemma2:2b")
 MAX_JUNK_EMAILS  = int(os.getenv("MAX_JUNK_EMAILS", "300"))
-MAX_HAM_EMAILS   = int(os.getenv("MAX_HAM_EMAILS", "200"))
 MAX_EMAIL_CHARS  = int(os.getenv("MAX_EMAIL_CHARS", "1000"))
 SIMILAR_RESULTS  = int(os.getenv("SIMILAR_RESULTS", "5"))
 
@@ -426,12 +422,12 @@ def classify_email_hybrid(content: str, msg, junk_collection) -> tuple:
     return classify_with_llm(content, msg, junk_collection, combined_score, distance_analysis)
 
 
-def classify_and_move(client: IMAPClient, junk_collection, ham_collection) -> None:
+def classify_and_move(client: IMAPClient, junk_collection) -> None:
     """Scan INBOX for unseen messages, classify each, and move spam to Junk.
 
     Uses the hybrid classifier which combines pattern matching + vector distances
-    with LLM fallback only for uncertain cases. HAM collection is no longer used
-    for classification (removed as noise source).
+    with LLM fallback only for uncertain cases. Only the Junk folder is used as
+    reference data — HAM folders are no longer synced or consulted.
     """
     client.select_folder(INBOX_FOLDER)
     uids = client.search(["UNSEEN"])
@@ -524,8 +520,8 @@ def main() -> None:
         action="store_true",
         help=(
             "Wipe and fully rebuild the vector DB from all configured folders, "
-            "then classify new mail. Use after changing HAM_FOLDERS, after "
-            "significantly increasing MAX_*_EMAILS, or to purge stale entries."
+            "then classify new mail. Use after significantly increasing MAX_*_EMAILS "
+            "or to purge stale entries."
         ),
     )
     args = parser.parse_args()
@@ -548,9 +544,6 @@ def main() -> None:
         junk_collection = chroma_client.get_or_create_collection(
             name="junk_folder_patterns"
         )
-        ham_collection = chroma_client.get_or_create_collection(
-            name="ham_folder_patterns"
-        )
     except Exception as exc:
         logger.error(f"Failed to initialize ChromaDB at {DB_PATH!r}: {exc}")
         sys.exit(1)
@@ -572,15 +565,8 @@ def main() -> None:
                 "Junk", full_rebuild=full,
             )
 
-            # Sync HAM examples from each configured folder
-            for folder in HAM_FOLDERS:
-                sync_folder(
-                    client, ham_collection, folder, MAX_HAM_EMAILS,
-                    f"HAM({folder})", full_rebuild=full,
-                )
-
             # Classify incoming mail
-            classify_and_move(client, junk_collection, ham_collection)
+            classify_and_move(client, junk_collection)
 
     except Exception as exc:
         logger.error(f"IMAP connection error: {exc}")

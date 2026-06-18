@@ -121,13 +121,11 @@ All settings live in `.env`. The only required values are the three IMAP credent
 
 ### Indexing Settings (Incremental DB)
 
-These control how many emails are indexed per folder. HAM folders are **indexed** but no longer used for classification — they exist only to keep the index up-to-date if you want them in future versions.
+This controls how many emails are indexed from the Junk folder in ChromaDB.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAX_JUNK_EMAILS` | `300` | How many recent junk emails to keep in memory |
-| `HAM_FOLDERS` | `Sent` | Comma-separated folders indexed for completeness |
-| `MAX_HAM_EMAILS` | `200` | How many HAM emails to index per folder (not used in classification) |
 
 ### Hybrid Classifier Thresholds
 
